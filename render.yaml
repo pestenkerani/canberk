@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: canberk-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: OPENAI_API_KEY
+        value: sk-xxx  # Render panelinde elle girilecek
