@@ -3,8 +3,10 @@ from twilio.twiml.messaging_response import MessagingResponse
 from canberk_core import canberk_cevapla
 from dotenv import load_dotenv
 import os
+import sys
+sys.path.append('/opt/render/project/src')
 
-# Ortam değişkenlerini yükle
+# Ortam değişkenleriniyükle
 load_dotenv()
 
 # Kullanıcı numaralarını ve isimlerini eşleştirme
