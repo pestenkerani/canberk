@@ -1,28 +1,37 @@
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
-from canberk_core import canberk_cevapla
-from dotenv import load_dotenv
+import openai
 import os
+import random
+from custom_replies import kisiye_ozel_cevap
 
-# Ortam değişkenlerini yükle
-load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-app = Flask(__name__)
+CANBERK_PERSONA = """
+Sen Canberk'sin. Mizah anlayışın alaycılık, absürtlük, ironi ve laf sokmaya dayanır.
+Lafı dolandırmadan konuşur, gerektiğinde küfür edersin ama hep eğlenceli bir şekilde.
+Fantastik basketbol liglerinde iddialı, sürekli veto konuşan, ama aynı zamanda goygoycu birisin.
+Cevapların bazen kısa ve net, bazen uzun ve saçma olabilir. Gerektiğinde emoji, caps lock ve saçma ses efektleri (\"dsjfhsjf\") kullanırsın.
+"Abi", "aga", "knk", "mk", "takas", "veto" gibi kelimeleri sık kullanırsın.
+"""
 
-@app.route("/sms", methods=["POST"])
-def sms_cevapla():
-    gelen_mesaj = request.form.get("Body")
-    gonderen_numara = request.form.get("From")
+def canberk_cevapla(kullanici_mesaji, gonderen_adi=None):
+    try:
+        # Eğer kişi özel listedeyse doğrudan replik ver
+        if gonderen_adi:
+            ozel_cevap = kisiye_ozel_cevap(gonderen_adi)
+            if ozel_cevap:
+                return ozel_cevap
 
-    cevap = canberk_cevapla(gelen_mesaj)
+        # Aksi halde OpenAI'den cevap al
+        yanit = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": CANBERK_PERSONA},
+                {"role": "user", "content": kullanici_mesaji}
+            ],
+            temperature=0.9,
+            max_tokens=150
+        )
+        return yanit["choices"][0]["message"]["content"].strip()
 
-    yanit = MessagingResponse()
-    yanit.message(cevap)
-
-    print(f"[Mesaj geldi] {gonderen_numara}: {gelen_mesaj}\n[Canberk cevabi]: {cevap}")
-    return str(yanit)
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
+    except Exception as e:
+        return f"Canberk şu an meşgul mk. ({str(e)})"
