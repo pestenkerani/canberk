@@ -15,6 +15,7 @@ Kullanım örnekleri:
 import argparse, json, pickle, ssl, socket, os
 import pandas as pd
 import requests, sqlite3, time, random, re, html, difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, quote_plus
 from urllib.error import HTTPError
@@ -96,14 +97,14 @@ AYARLAR = {
     ],
 
     'DOGRALANACAK_EN_IYI_ADAY_SAYISI': 4,
-    'ISTEK_ZAMAN_ASIMI': 10,
+    'ISTEK_ZAMAN_ASIMI': 6,
 
     'CACHE_DB': 'site_finder_cache.sqlite',
-    'GOOGLE_RESULTS_PER_QUERY': 6,
-    'DUCK_RESULTS_PER_QUERY': 10,
+    'GOOGLE_RESULTS_PER_QUERY': 4,
+    'DUCK_RESULTS_PER_QUERY': 8,
 
     # Deep verify
-    'DEEP_PATHS': ["", "iletisim", "hakkimizda", "en/contact", "tr/iletisim", "about", "contact", "sitemap.xml"],
+    'DEEP_PATHS': ["", "iletisim", "hakkimizda", "about", "contact"],
     'MIN_SINYAL_AUTO_DOMAIN': 2,
     'GECER_MIN_PUAN': 5,
 
@@ -331,7 +332,15 @@ def fetch(url:str, timeout:int) -> Optional[str]:
         CACHE.set_html(url, html_text)
         return html_text
     except Exception:
-        return None
+        # kısa backoff ile ikinci bir deneme (farklı UA)
+        try:
+            r = SESSION.get(url, headers=headers(), timeout=max(3, timeout-2), allow_redirects=True)
+            r.raise_for_status()
+            html_text = r.text
+            CACHE.set_html(url, html_text)
+            return html_text
+        except Exception:
+            return None
 
 # ===== Arama backendleri =====
 def _serpapi_key() -> Optional[str]:
@@ -405,11 +414,17 @@ def search_duckduckgo_html(query:str, n:int) -> List[str]:
 def run_search(query:str) -> List[str]:
     cached = CACHE.get_results(query)
     if cached is not None: return cached
+    # Google ve DDG paralel çalışsın
     results = []
-    g = search_google(query, AYARLAR['GOOGLE_RESULTS_PER_QUERY'])
-    results.extend(g)
-    if len(results) < AYARLAR['GOOGLE_RESULTS_PER_QUERY']:
-        results.extend(search_duckduckgo_html(query, AYARLAR['DUCK_RESULTS_PER_QUERY']))
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_g = ex.submit(search_google, query, AYARLAR['GOOGLE_RESULTS_PER_QUERY'])
+        fut_d = ex.submit(search_duckduckgo_html, query, AYARLAR['DUCK_RESULTS_PER_QUERY'])
+        for fut in as_completed([fut_g, fut_d]):
+            try:
+                part = fut.result() or []
+                results.extend(part)
+            except Exception:
+                pass
     # uniq + cache
     clean, seen = [], set()
     for u in results:
@@ -431,7 +446,7 @@ def candidate_domains(firma_adi:str) -> List[str]:
         return []
     compact, dashed = marka_cekirdegi_bilesik(core_tokens)
     subs = [compact, dashed]
-    endings = [".com.tr",".com"]
+    endings = [".com.tr",".com",".net",".org"]
     cands = []
     for s in subs:
         for e in endings:
@@ -676,15 +691,19 @@ def _core_variants(core_tokens: list[str]) -> list[str]:
     return [x for x in v if x]
 
 def en_iyi_sosyal_medya_linkini_bul(firma_adi:str, firma_tokens:List[str]) -> str:
-    print("      -> Resmi site bulunamadı, sosyal medya aranıyor...")
     aday = set()
-    for sablon in AYARLAR['SOSYAL_MEDYA_SORGULARI']:
-        q = sablon.format(firma_adi=firma_adi, il="")
-        try:
-            for u in run_search(q)[:5]:
-                if is_social(u): aday.add(u)
-        except Exception:
-            continue
+    # Sosyal aramaları paralel ve sınırlı sonuçla çek
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = []
+        for sablon in AYARLAR['SOSYAL_MEDYA_SORGULARI']:
+            q = sablon.format(firma_adi=firma_adi, il="")
+            futs.append(ex.submit(run_search, q))
+        for fut in as_completed(futs):
+            try:
+                for u in (fut.result() or [])[:5]:
+                    if is_social(u): aday.add(u)
+            except Exception:
+                continue
     if not aday:
         return "Sosyal Medya Hesabı Yok"
 
@@ -806,15 +825,16 @@ def en_iyi_siteyi_bul(firma_adi:str, il:str, norm_firma:str, firma_tokens:List[s
     aday_adresler = set(auto_set)
 
     # 2) Arama sonuçları
-    for sablon in AYARLAR['ARAMA_SORGULARI']:
-        q = sablon.format(firma_adi=firma_adi, il=il)
-        try:
-            for u in run_search(q):
-                aday_adresler.add(u)
-        except HTTPError:
-            time.sleep(15); continue
-        except Exception:
-            continue
+    # Aramaları paralel çalıştır
+    queries = [sablon.format(firma_adi=firma_adi, il=il) for sablon in AYARLAR['ARAMA_SORGULARI']]
+    with ThreadPoolExecutor(max_workers=len(queries)) as ex:
+        futs = [ex.submit(run_search, q) for q in queries]
+        for fut in as_completed(futs):
+            try:
+                for u in fut.result() or []:
+                    aday_adresler.add(u)
+            except Exception:
+                continue
     if not aday_adresler:
         return "Arama Sonucu Yok"
 
@@ -834,46 +854,47 @@ def en_iyi_siteyi_bul(firma_adi:str, il:str, norm_firma:str, firma_tokens:List[s
     core_tokens = marka_cekirdegi_tokenleri(norm_firma)
     aday_gecerler = []
 
-    for a in topk:
+    # İçerik kontrolünü paralel yap
+    def _evaluate(a):
         html_text = fetch(a['url'], AYARLAR['ISTEK_ZAMAN_ASIMI'])
         sig = {}
         sinyal_say = 0
+        puan = a['puan']
         if html_text:
-            # Parked kontrol
             html_norm = metni_normallestir(html_text)
             if is_parked_page(html_norm):
-                a['puan'] = -999; continue
-
+                return None
             cs, cscnt, sig = content_score(a['url'], norm_firma, aranan_sektorler, il, core_tokens)
-            a['puan'] += cs
+            puan += cs
             sinyal_say = cscnt
         else:
-            # HTML yoksa ve auto domain ise ele
             if a['url'] in auto_set:
-                a['puan'] = -999; continue
-
-        # Deep Verify (gerekirse)
+                return None
         if deep_verify_on and (a['url'] in auto_set or sinyal_say == 0):
             dv_sum, dv_pages = deep_verify(a['url'], norm_firma, aranan_sektorler, il, core_tokens)
-            sinyal_say += dv_sum  # sinyalleri topla (sayfa bazlı)
-        # Min sinyal şartı (auto domain için)
+            sinyal_say += dv_sum
         if a['url'] in auto_set and sinyal_say < MIN_SINYAL:
-            a['puan'] = -999; continue
-        # Zayıf olanları ele
-        if sinyal_say == 0 and a['puan'] <= GECER_MIN_PUAN:
-            a['puan'] = -999; continue
-
-        # Kalibrasyon varsa olasılığa bak
+            return None
+        if sinyal_say == 0 and puan <= GECER_MIN_PUAN:
+            return None
+        rec = {'url': a['url'], 'puan': puan}
         if calib_tuple[0]:
-            feats = extract_features(a['url'], sig or {"title":"","metas":"","og":"","h":"","footer":"","full":""},
-                                     a['puan'], norm_firma, aranan_sektorler, il, core_tokens)
+            feats = extract_features(a['url'], sig or {"title":"","metas":"","og":"","h":"","footer":"","full":""}, puan, norm_firma, aranan_sektorler, il, core_tokens)
             p = predict_proba_from_feats(feats, calib_tuple)
             if p is not None:
-                a['proba'] = p
+                rec['proba'] = p
                 if prob_threshold is not None and p < prob_threshold:
-                    # yeterince emin değil → ele
-                    a['puan'] = -999; continue
-        aday_gecerler.append(a)
+                    return None
+        return rec
+
+    with ThreadPoolExecutor(max_workers=min(6, len(topk))) as ex:
+        futs = [ex.submit(_evaluate, a) for a in topk]
+        for fut in as_completed(futs):
+            try:
+                res = fut.result()
+                if res: aday_gecerler.append(res)
+            except Exception:
+                continue
 
     if not aday_gecerler:
         return "Yeterli Skora Sahip Aday Yok"
@@ -888,17 +909,19 @@ def en_iyi_siteyi_bul(firma_adi:str, il:str, norm_firma:str, firma_tokens:List[s
 def en_iyi_site_adaylari(firma_adi, il, norm_firma, firma_tokens, aranan_sektorler, topk=3, deep_verify_on=True):
     auto_set = set(candidate_domains(firma_adi))
     aday_adresler = set(auto_set)
-    for sablon in AYARLAR['ARAMA_SORGULARI']:
-        q = sablon.format(firma_adi=firma_adi, il=il)
-        try:
-            for u in run_search(q):
-                aday_adresler.add(u)
-        except Exception:
-            continue
+    queries = [sablon.format(firma_adi=firma_adi, il=il) for sablon in AYARLAR['ARAMA_SORGULARI']]
+    with ThreadPoolExecutor(max_workers=len(queries)) as ex:
+        futs = [ex.submit(run_search, q) for q in queries]
+        for fut in as_completed(futs):
+            try:
+                for u in fut.result() or []:
+                    aday_adresler.add(u)
+            except Exception:
+                continue
 
     puanlanmis = []
     core_tokens = marka_cekirdegi_tokenleri(norm_firma)
-    for url in aday_adresler:
+    def _review_eval(url):
         url_skor = quick_url_score(url, "", norm_firma.split())
         html_text = fetch(url, AYARLAR['ISTEK_ZAMAN_ASIMI'])
         kanit = {}
@@ -923,7 +946,15 @@ def en_iyi_site_adaylari(firma_adi, il, norm_firma, firma_tokens, aranan_sektorl
                 if dv_sum >= AYARLAR['MIN_SINYAL_AUTO_DOMAIN']: flags.append("deep-verify")
             kanit = {"flags": ",".join(flags) if flags else "", "title": sig['title'][:120], "sinyal": sinyal_say}
         toplam = url_skor + c_skor
-        puanlanmis.append({"url": url, "puan": toplam, "kanit": kanit})
+        return {"url": url, "puan": toplam, "kanit": kanit}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(aday_adresler)) ) as ex:
+        futures = [ex.submit(_review_eval, url) for url in aday_adresler]
+        for fut in as_completed(futures):
+            try:
+                puanlanmis.append(fut.result())
+            except Exception:
+                continue
 
     top = sorted(puanlanmis, key=lambda x: x['puan'], reverse=True)[:topk]
     return top
@@ -1017,7 +1048,7 @@ def calistir_review_modu(girdi="yenitest.csv", cikti_xlsx="review.xlsx", topk=3,
             base["İnceleme Önceliği"] = "YÜKSEK"
 
         rows.append(base)
-        time.sleep(random.uniform(0.6, 1.2))
+        time.sleep(random.uniform(0.2, 0.5))
 
     rev = pd.DataFrame(rows)
     try:
@@ -1043,7 +1074,7 @@ def calistir_run_modu(girdi="yenitest.csv", cikti="firma_sonuclari_PRO.csv", dee
     if "Firma Adı" not in df.columns:
         print("HATA: CSV'de 'Firma Adı' yok."); return
 
-    print("Script Çalışıyor...\n")
+    print("Script Çalışıyor...\nNot: Hız için aramalar ve doğrulamalar paralelleştirildi, API anahtarı kullanılmıyor.")
     out = []
     total = len(df)
     for i, row in df.iterrows():
@@ -1054,7 +1085,7 @@ def calistir_run_modu(girdi="yenitest.csv", cikti="firma_sonuclari_PRO.csv", dee
         link = firma_icin_en_iyi_linki_bul(firma, sektor, adres, deep_verify_on=deep_verify_on, prob_threshold=prob_threshold, calib_tuple=calib_tuple)
         out.append(link)
         print(f"    └──> Sonuç: {link}\n")
-        time.sleep(random.uniform(0.8, 1.6))
+        time.sleep(random.uniform(0.25, 0.6))
 
     df["Bulunan Link"] = out
     df.to_csv(cikti, index=False, encoding='utf-8-sig')
