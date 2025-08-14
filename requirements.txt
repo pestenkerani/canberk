@@ -1,5 +1,6 @@
-flask
-openai
-twilio
-python-dotenv
-openai==0.28.1
+requests==2.32.3
+# Optional dependencies (only if you want PNG output)
+Pillow==10.4.0
+python-slugify==8.0.4
+tqdm==4.66.4
+python-dotenv==1.0.1
