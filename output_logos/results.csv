@@ -1,0 +1,6 @@
+property_name,city,district,website,status,source,source_url,saved_path,notes
+The Ritz London,London,Westminster,https://www.theritzlondon.com/,success,instagram,https://instagram.com/theritzlondon/,/workspace/output_logos/the-ritz-london.jpg,instagram from website
+The Savoy,London,Westminster,https://www.thesavoylondon.com/,success,instagram,https://instagram.com/thesavoylondon/,/workspace/output_logos/the-savoy.jpg,instagram from website
+Claridge's,London,Mayfair,https://www.claridges.co.uk/,success,instagram,https://www.instagram.com/claridgeshotel/,/workspace/output_logos/claridges.jpg,instagram from website
+The Plaza,New York,Manhattan,https://www.theplazany.com/,success,instagram,http://www.instagram.com/theplazahotel/,/workspace/output_logos/the-plaza.jpg,instagram from website
+Raffles Singapore,Singapore,City Hall,https://www.rafflessingapore.com/,success,instagram,https://www.instagram.com/rafflescitysg/,/workspace/output_logos/raffles-singapore.jpg,instagram from search
